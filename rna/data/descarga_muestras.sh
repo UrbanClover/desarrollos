@@ -1,3 +1,6 @@
+# Con este pequeño script se descargan las muestras que se han usado para la ejecución de este código. 
+# Estas muestras están pensadas para almacenarse y procesarse en un servidor externo debido al elevado peso y necesidad de capacidad de computo para su procesado.
+
 wget -O Ctrl2_R1.fastq.gz 'http://ftp.sra.ebi.ac.uk/vol1/fastq/SRR134/064/SRR13439464/SRR13439464_1.fastq.gz'
 wget -O Ctrl2_R2.fastq.gz 'http://ftp.sra.ebi.ac.uk/vol1/fastq/SRR134/064/SRR13439464/SRR13439464_2.fastq.gz'
 
