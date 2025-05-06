@@ -1,0 +1,11 @@
+FID	IID	PHENO
+0	LC_1_Cancer	2
+0	LC_1_Normal	1
+0	LC_2_Cancer	2
+0	LC_2_Normal	1
+0	LC_3_Cancer	2
+0	LC_3_Normal	1
+0	LC_4_Cancer	2
+0	LC_4_Normal	1
+0	LC_5_Cancer	2
+0	LC_5_Normal	1
