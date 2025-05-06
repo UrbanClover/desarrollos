@@ -1,0 +1,136 @@
+# Snakefile para RNA
+
+import sys
+sys.path.append('ngs')
+import sample_ids
+SAMPLE = sample_ids.get_sample_ids('data')
+print("Muestras detectadas: ", SAMPLE)
+
+# Genoma de referencia
+
+GENOME_DIR="/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/ref/rna_ref/ref_index"
+SALMON_INDEX="/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/ref/rna_ref/salmon_index"
+ARRIBA_INDEX="/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/ref/rna_ref/arriba"
+
+# Rules
+
+localrules:  all
+
+rule all:
+        input:
+                trim = expand('resultados/trimmed/{S}_trimmed_{N}.fastq.gz', S=SAMPLE, N=['1', '2']),
+                aligned = expand('resultados/aligned/{S}/{S}_filtered.bam', S=SAMPLE),
+                salmon=expand('resultados/salmon/{S}/quant.sf', S=SAMPLE),
+                arriba=expand('resultados/arriba/{S}_fusions.tsv', S=SAMPLE)
+
+
+# Análisis
+
+rule trim:
+        input:
+                r1="data/{S}_R1.fastq.gz",
+                r2="data/{S}_R2.fastq.gz"
+        output:
+                r1='resultados/trimmed/{S}_trimmed_1.fastq.gz',
+                r2='resultados/trimmed/{S}_trimmed_2.fastq.gz',
+                html='resultados/trimmed/{S}_fastp.html'
+        resources:
+                runtime=90,
+                cpus_per_task=4,
+                mem_mb=24000,
+                account="othcx"                
+        shell:
+                """
+                module load cesga/2020 gcccore/system fastp/0.22.0 
+                fastp -i {input.r1} -I {input.r2} \
+                -o {output.r1} -O {output.r2} -A \
+                --cut_front --cut_tail --cut_mean_quality=25 \
+                --low_complexity_filter \
+                --length_required 36 \
+                --qualified_quality_phred 25 \
+                --html {output.html} 
+                module unload cesga/2020 gcccore/system fastp/0.22.0
+                """
+rule star_align:
+        input:
+                r1='resultados/trimmed/{S}_trimmed_1.fastq.gz',
+                r2='resultados/trimmed/{S}_trimmed_2.fastq.gz'
+        output:
+                bam_aligned='resultados/aligned/{S}/{S}_Aligned.out.bam',
+                bam_sorted_by_name='resultados/aligned/{S}/{S}_sorted_by_name.bam',
+                bam_filtered='resultados/aligned/{S}/{S}_filtered.bam'
+        threads: 128
+        resources:
+                runtime=2880,
+                cpus_per_task=8,
+                mem_mb=64000,
+                account="othcx"
+        params:
+                genome_dir=GENOME_DIR,
+                prefix='resultados/aligned/{S}/'
+        shell:
+                """
+                module load cesga/2022 gcc/system star/2.7.11b
+                STAR --runThreadN {threads} --readFilesCommand zcat --readFilesIn {input.r1} {input.r2} --genomeDir {params.genome_dir} \
+                --peOverlapNbasesMin 10 --alignSplicedMateMapLminOverLmate 0.5 --alignSJstitchMismatchNmax 5 -1 5 5 --chimJunctionOverhangMin 10 --chimScoreDropMax 30 \
+                --chimScoreJunctionNonGTAG 0 --chimScoreSeparation 1 --chimSegmentReadGapMax 3 --chimMultimapNmax 50 \
+                --outSAMtype BAM Unsorted --chimOutType WithinBAM --chimSegmentMin 10 --outReadsUnmapped None --outSAMstrandField intronMotif --outSAMunmapped Within KeepPairs \
+                --outSAMattrRGline ID:Z LB:TRUSEQ SM:TUMOR PL:ILLUxMINA PU:HIS_200 DS:RNA --outFilterMultimapNmax 50 \
+                --outFilterMismatchNoverLmax 0.04 --alignIntronMin 20 --alignIntronMax 200000 --alignMatesGapMax 1000000 \
+                --outFileNamePrefix resultados/aligned/{wildcards.S}/{wildcards.S}_
+                module unload cesga/2022 gcc/system star/2.7.11b
+
+                module load cesga/2020 gcccore/system samtools/1.19
+                samtools sort -n resultados/aligned/{wildcards.S}/{wildcards.S}_Aligned.out.bam -o resultados/aligned/{wildcards.S}/{wildcards.S}_sorted_by_name.bam
+                samtools fixmate -u -m resultados/aligned/{wildcards.S}/{wildcards.S}_sorted_by_name.bam - | samtools sort -T resultados/aligned/{wildcards.S}/tmp_{wildcards.S} - | \
+                samtools markdup - - | samtools view -h -q 10 -b - > resultados/aligned/{wildcards.S}/{wildcards.S}_filtered.bam
+                """
+
+rule salmon_quant:
+    input:
+        r1='resultados/trimmed/{S}_trimmed_1.fastq.gz',
+        r2='resultados/trimmed/{S}_trimmed_2.fastq.gz'
+    output:
+        quant='resultados/salmon/{S}/quant.sf'
+    params:
+        index=SALMON_INDEX,
+        libtype="A"
+    resources:
+        runtime=600,
+        cpus_per_task=8,
+        mem_mb=8000,
+        account="othcx"
+    shell:
+        """
+        module load cesga/2020 gcc/system salmon/1.10.2
+        mkdir -p resultados/salmon/{wildcards.S}
+        salmon quant -i {params.index} -l {params.libtype} \
+        -1 {input.r1} -2 {input.r2} \
+        -o resultados/salmon/{wildcards.S} \
+        --validateMappings --gcBias
+        module unload cesga/2020 gcc/system salmon/1.10.2
+        """
+
+rule arriba_fusion:
+    input:
+        reads_aligned='resultados/aligned/{S}/{S}_filtered.bam',
+        ref_fa=os.path.join(GENOME_DIR, "GRCh38.primary_assembly.genome.fa"),
+        gtf=os.path.join(GENOME_DIR, "gencode.v47.primary_assembly.basic.annotation.gtf"),
+        blacklist=os.path.join(ARRIBA_INDEX, "blacklist_hg38_GRCh38_v2.4.0.tsv"),
+        known_fusions= os.path.join(ARRIBA_INDEX, "known_fusions_hg38_GRCh38_v2.4.0.tsv")
+    output:
+        fusions='resultados/arriba/{S}_fusions.tsv',
+        discarded='resultados/arriba/{S}_fusions.discarded.tsv'
+    resources:
+        runtime=600,
+        cpus_per_task=4,
+        mem_mb=16000,
+        account="othcx"
+    shell:
+        """
+        module load cesga/2020 gcc/system arriba/2.4.0
+        arriba -x {input.reads_aligned} -a {input.ref_fa} -g {input.gtf} -b {input.blacklist} -k {input.known_fusions} \
+        -X -I -S 3 -A 10 \
+        -o resultados/arriba/{wildcards.S}_fusions.tsv -O resultados/arriba/{wildcards.S}_fusions.discarded.tsv
+        module unload cesga/2020 gcc/system arriba/2.4.0
+        """
