@@ -1,0 +1,269 @@
+# Snakefile para WES (DNA) - Análisis Completo
+import sys
+sys.path.append('ngs')
+import sample_ids
+
+# Configuración de muestras y referencias
+SAMPLES = sample_ids.get_sample_ids('data')
+REF_GENOME = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/ref/wes_ref/GRCh38.p14.genome.fa"
+KNOWN_SITES = [
+    "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/ref/wes_ref/dbsnp_146.hg38.vcf.gz",
+    "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/ref/wes_ref/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz"
+]
+
+# Genes objetivo
+TARGET_GENES = {
+    "LTBP4": "chr19:41123456-41456789",  # Actualizar coordenadas reales
+    "IDH1": "chr2:209113123-209234567"    # Actualizar coordenadas reales
+}
+
+# Regla principal
+rule all:
+    input:
+        expand("resultados/final_vcf/{sample}_filtered.vcf.gz", sample=SAMPLES),
+        expand("resultados/gene_mutations/{sample}_mutations.tsv", sample=SAMPLES)
+
+# -------------------------------------------------------------------
+# 1. Trimming con fastp (similar a tu configuración previa)
+# -------------------------------------------------------------------
+rule trim:
+    input:
+        r1="data/{sample}_1.fastq.gz",
+        r2="data/{sample}_2.fastq.gz"
+    output:
+        r1="resultados/trimmed/{sample}_trimmed_1.fastq.gz",
+        r2="resultados/trimmed/{sample}_trimmed_2.fastq.gz",
+        html="resultados/trimmed/{sample}_fastp.html"
+    resources:
+        runtime=90, cpus_per_task=4, mem_mb=4000, account="othcx"
+    shell:
+        """
+        module load cesga/2020 gcccore/system fastp/0.22.0
+        fastp -i {input.r1} -I {input.r2} \
+              -o {output.r1} -O {output.r2} \
+              --detect_adapter_for_pe \
+              --trim_poly_g --poly_g_min_len=10 \
+              --low_complexity_filter \
+              --overrepresentation_analysis \
+              --correction \
+              --html={output.html}
+        module unload cesga/2020 gcccore/system fastp/0.22.0
+        """
+
+# -------------------------------------------------------------------
+# 2. Alineamiento con BWA-MEM
+# -------------------------------------------------------------------
+rule bwa_mem:
+    input:
+        r1=rules.trim.output.r1,
+        r2=rules.trim.output.r2
+    output:
+        "resultados/aligned/{sample}.bam"
+    resources:
+        runtime=2880, cpus_per_task=4, mem_mb=64000, account="othcx"
+    params:
+        ref=REF_GENOME,
+        rg="@RG\\tID:{sample}\\tSM:{sample}\\tPL:ILLUMINA"
+    shell:
+        """
+        module load cesga/2020 gcccore/system bwa/0.7.17 samtools/1.19
+        bwa mem -R '{params.rg}' {params.ref} {input.r1} {input.r2} | \
+            samtools view -Sb - > {output}
+        module unload cesga/2020 gcccore/system bwa/0.7.17 samtools/1.19
+        """
+
+# -------------------------------------------------------------------
+# 3. Ordenado del BAM con samtools
+# -------------------------------------------------------------------
+rule sort_bam:
+    input:
+        "resultados/aligned/{sample}.bam"
+    output:
+        "resultados/sorted/{sample}.sorted.bam"
+    resources:
+        runtime=1440, cpus_per_task=4, mem_mb=16000, account="othcx"
+    shell:
+        """
+        module load cesga/2020 samtools/1.19
+        samtools sort -@ {threads} -o {output} {input}
+        module unload cesga/2020 samtools/1.19
+        """
+
+# -------------------------------------------------------------------
+# 4. Marcaje de Duplicados
+# -------------------------------------------------------------------
+rule mark_duplicates:
+    input:
+        "resultados/sorted/{sample}.sorted.bam"  
+    output:
+        bam="resultados/dedup/{sample}.dedup.bam",
+        metrics="resultados/dedup/{sample}.dedup.metrics"
+    resources:
+        runtime=1440, cpus_per_task=4, mem_mb=64000, account="othcx"
+    shell:
+        """
+        module load cesga/2020 picard/2.25.5 jdk/11.0.16
+        export JAVA_OPTS="-Xmx56g -Djava.io.tmpdir=$TMPDIR"
+        # Buscar la ruta del JAR de Picard (ejemplo común):
+        PICARD_JAR=$(find $EBROOTPICARD -name "picard.jar")
+        java -jar $PICARD_JAR MarkDuplicates \
+            I={input} \
+            O={output.bam} \
+            M={output.metrics} \
+            REMOVE_DUPLICATES=true \
+            VALIDATION_STRINGENCY=SILENT
+        module unload cesga/2020 picard/2.25.5 jdk/11.0.16
+        """
+
+# -------------------------------------------------------------------
+# 5. Recalibración de Calidad (BQSR) con GATK
+# -------------------------------------------------------------------
+rule baserecalibrator:
+    input:
+        bam=rules.mark_duplicates.output.bam,
+        known=KNOWN_SITES
+    output:
+        table="resultados/recal/{sample}.recal.table"
+    resources:
+        runtime=2160, cpus_per_task=4, mem_mb=64000, account="othcx"
+    shell:
+        """
+        module load cesga/2020 gatk/4.2.6.1
+        export TMPDIR=resultados/tmp
+        mkdir -p $TMPDIR
+        gatk BaseRecalibrator \
+            -I {input.bam} \
+            -R {REF_GENOME} \
+            --known-sites {input.known[0]} \
+            --known-sites {input.known[1]} \
+            -O {output.table} \
+            --tmp-dir $TMPDIR
+        module unload cesga/2020 gatk/4.2.6.1
+        """
+
+rule applybqsr:
+    input:
+        bam=rules.mark_duplicates.output.bam,
+        table=rules.baserecalibrator.output.table
+    output:
+        "resultados/recal/{sample}.recal.bam"
+    resources:
+        runtime=1440, cpus_per_task=4, mem_mb=16000, account="othcx"
+    shell:
+        """
+        module load cesga/2020 gatk/4.2.6.1
+        gatk ApplyBQSR \
+            -I {input.bam} \
+            -R {REF_GENOME} \
+            --bqsr-recal-file {input.table} \
+            -O {output}
+        module unload cesga/2020 gatk/4.2.6.1
+        """
+
+# -------------------------------------------------------------------
+# 6. Llamado de Variantes con HaplotypeCaller
+# -------------------------------------------------------------------
+rule haplotype_caller:
+    input:
+        bam=rules.applybqsr.output
+    output:
+        vcf="resultados/vcf/{sample}.raw.vcf"
+    resources:
+        runtime=2880, cpus_per_task=4, mem_mb=32000, account="othcx"
+    shell:
+        """
+        module load cesga/2020 gatk/4.2.6.1
+        gatk HaplotypeCaller \
+            -R {REF_GENOME} \
+            -I {input.bam} \
+            -O {output.vcf} \
+            -ERC GVCF
+        module unload cesga/2020 gatk/4.2.6.1
+        """
+
+
+# -------------------------------------------------------------------
+# 6.1. Compresión del VCF con bgzip
+# -------------------------------------------------------------------
+rule compress_vcf:
+    input:
+        vcf="resultados/vcf/{sample}.raw.vcf"
+    output:
+        gz="resultados/vcf/{sample}.raw.vcf.gz"
+    resources:
+        runtime=60, cpus_per_task=2, mem_mb=2000, account="othcx"
+    shell:
+        """
+        module load cesga/2020 htslib/1.19
+        bgzip -c {input.vcf} > {output.gz}
+        module unload cesga/2020 htslib/1.19
+        """
+
+# -------------------------------------------------------------------
+# 6.2. Indexado del VCF comprimido
+# -------------------------------------------------------------------
+rule index_vcf:
+    input:
+        "resultados/vcf/{sample}.raw.vcf.gz"
+    output:
+        "resultados/vcf/{sample}.raw.vcf.gz.tbi"
+    resources:
+        runtime=60, cpus_per_task=2, mem_mb=2000, account="othcx"
+    shell:
+        """
+        module load cesga/2020 htslib/1.19
+        tabix -p vcf {input}
+        module unload cesga/2020 htslib/1.19
+        """
+
+
+# -------------------------------------------------------------------
+# 7. Filtrado de Variantes en Genes Específicos
+# -------------------------------------------------------------------
+rule filter_variants:
+    input:
+        vcf=rules.compress_vcf.output,
+        idx=rules.index_vcf.output
+    output:
+        "resultados/final_vcf/{sample}_filtered.vcf.gz"
+    params:
+        regions=','.join(TARGET_GENES.values())
+    resources:
+        runtime=2880, cpus_per_task=4, mem_mb=32000, account="othcx"
+    shell:
+        """
+        module load cesga/2020 bcftools/1.19
+        bcftools view {input.vcf} \
+            -r {params.regions} \
+            -Oz -o {output}
+        module unload cesga/2020 bcftools/1.19
+        """
+
+# -------------------------------------------------------------------
+# 8. Asignación de Valor Binario
+# -------------------------------------------------------------------
+rule check_mutations:
+    input:
+        vcf=rules.filter_variants.output
+    output:
+        "resultados/gene_mutations/{sample}_mutations.tsv"
+    resources:
+        runtime=2880, cpus_per_task=4, mem_mb=32000, account="othcx"
+    shell:
+        """
+        module load cesga/2020 bcftools/1.19
+        # Desactiva modo estricto temporalmente para manejar errores
+        set +e
+        # Contar variantes no reference, permitiendo que bcftools falle silenciosamente
+        count=$(bcftools view -i 'GT!="0/0"' {input.vcf} | grep -vc '^#')
+        # Restaura modo estricto
+        set -e
+        
+        # Asignar valor binario
+        if [ "$count" -ge 1 ]; then
+            echo -e "{wildcards.sample}\\t1" > {output}
+        else
+            echo -e "{wildcards.sample}\\t0" > {output}
+        fi
+        module unload cesga/2020 bcftools/1.19
+        """

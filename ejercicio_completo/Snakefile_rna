@@ -1,0 +1,157 @@
+configfile: "config.yaml"
+
+import os
+
+wildcard_constraints:
+    id="R?0*[0-9]+", 
+    tumor_type="primary_tumor|recurrent_tumor"
+
+# ==============================================
+# Obtener muestras de ARN
+# ==============================================
+
+
+def get_rna_samples():
+    samples_output = os.popen("python scripts/get_rna_samples.py").read()
+    samples = []
+    # Procesar salida incluyendo el prefijo R
+    for line in samples_output.strip().split("\n"):
+        if line.startswith("ID: "):
+            id_part = line.split("ID: ")[1].split(", Tipo: ")[0]
+            tumor_type = line.split("Tipo: ")[1]
+            samples.append((id_part, tumor_type))
+    return samples
+
+# ----------------------------------------------------------------
+# Obtener lista de muestras para Snakemake
+# ----------------------------------------------------------------
+SAMPLES_RNA = get_rna_samples()
+IDS         = [s[0] for s in SAMPLES_RNA]
+TUMOR_TYPES = [s[1] for s in SAMPLES_RNA]
+
+rule all:
+    input:
+        expand("results/star/{id}_{tumor_type}/Aligned.sortedByCoord.out.bam",
+               id=IDS, tumor_type=TUMOR_TYPES),
+        expand("results/salmon/{id}_{tumor_type}",
+               id=IDS, tumor_type=TUMOR_TYPES),
+        "results/patient_expression/patient_expression_values.tsv",
+        "results/top_transcripts/top10_common_transcripts.txt"
+
+
+
+# --------------------------------------------------
+# 1. Alinear cada réplica por separado
+# --------------------------------------------------
+rule star_alignment:
+    input:
+        fastq= "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/exercicio_completo/data/R{id}.RNA.{tumor_type}_{rep}.fastq.gz",
+    output:
+        bam = "results/star/{id}_{tumor_type}_{rep}/Aligned.sortedByCoord.out.bam",
+        log = "results/star/{id}_{tumor_type}_{rep}/Log.final.out"
+    params:
+        genome_dir = config["star_genome_dir"],
+        prefix = "results/star/{id}_{tumor_type}_{rep}/"
+    resources:
+        runtime=900, 
+        cpus_per_task=4, 
+        mem_mb=64000, 
+        account="othcx"
+    threads: 6
+    shell:
+        """
+        module load cesga/2022 gcc/system star/2.7.11b
+        mkdir -p {params.prefix}
+        STAR --genomeDir {config[star_genome_dir]} \
+             --readFilesCommand zcat \
+             --runThreadN {threads} \
+             --limitBAMsortRAM 64000000000 \
+             --outSAMtype BAM SortedByCoordinate \
+             --outFileNamePrefix {params.prefix} \
+             --readFilesIn {input.fastq}
+        module unload cesga/2022 gcc/system star/2.7.11b
+        """
+
+# --------------------------------------------------
+# 2. Merge de los 3 BAMs en uno solo por muestra
+# --------------------------------------------------
+rule merge_bams:
+    input:
+        lambda wc: expand(
+            "results/star/{id}_{tumor_type}_{rep}/Aligned.sortedByCoord.out.bam",
+            id=wc.id, tumor_type=wc.tumor_type,
+            rep=["1","2","3"]
+        )
+    output:
+        bam = "results/star/{id}_{tumor_type}/Aligned.sortedByCoord.out.bam"
+    resources:
+        runtime=900, 
+        cpus_per_task=4, 
+        mem_mb=16000, 
+        account="othcx"
+    threads: 1
+    shell:
+        """
+        module load cesga/2020 gcccore/system samtools/1.19
+        samtools merge {output.bam} {input}
+        module unload cesga/2020 gcccore/system samtools/1.19
+        """
+
+# --------------------------------------------------
+# 3. Salmon
+# --------------------------------------------------
+
+rule salmon_quant:
+    input:
+        r1 = "data/R{id}.RNA.{tumor_type}_1.fastq.gz",
+        r2 = "data/R{id}.RNA.{tumor_type}_2.fastq.gz",
+        r3 = "data/R{id}.RNA.{tumor_type}_3.fastq.gz"
+    output:
+        directory("results/salmon/{id}_{tumor_type}")
+    params:
+        index = config["salmon_index"]
+    resources:
+        runtime=900, 
+        cpus_per_task=4, 
+        mem_mb=16000, 
+        account="othcx"
+    shell:
+        """
+        module load cesga/2020 gcc/system salmon/1.10.2
+        salmon quant -i {params.index} \
+            -l A \
+            --gcBias \
+            -r {input.r1} {input.r2} {input.r3} \
+            -p {threads} \
+            --validateMappings \
+            -o {output}
+        module unload cesga/2020 gcc/system salmon/1.10.2
+        """
+
+rule generate_metadata:
+    output:
+        "results/expression_matrix/sample_metadata.tsv"
+    resources:
+        runtime=900, 
+        cpus_per_task=4, 
+        mem_mb=16000, 
+        account="othcx"
+    run:
+        with open(output[0], 'w') as f:
+            f.write("sample_id\ttumor_type\n")
+            for id, tumor_type in SAMPLES_RNA:
+                f.write(f"{id}_{tumor_type}\t{tumor_type}\n")
+
+rule generate_expression_matrix:
+    input:
+        expand("results/salmon/{id}_{tumor_type}/quant.sf", zip, id=[s[0] for s in SAMPLES_RNA], tumor_type=[s[1] for s in SAMPLES_RNA]),
+        "results/expression_matrix/sample_metadata.tsv"
+    output:
+        "results/expression_matrix/transcript_matrix.tsv"
+    resources:
+        runtime=900, 
+        cpus_per_task=4, 
+        mem_mb=16000, 
+        account="othcx"
+    script:
+        "scripts/generate_matrix.R"
