@@ -1,0 +1,107 @@
+# Snakefile para WES
+
+import sys
+sys.path.append('ngs')
+import sample_ids
+SAMPLE = sample_ids.get_sample_ids('data')
+print("Muestras detectadas: ", SAMPLE)
+
+# Modificar la sección de muestras
+PATIENTS = list(set([s.rsplit('_', 1)[0] for s in SAMPLE]))
+print("Pacientes detectados: ", PATIENTS)
+
+# Referencia
+
+REF_GENOME = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/ref/wes_ref/GRCh38.p14.genome.fa"
+
+# Rules
+
+localrules:  all
+
+rule all:
+        input:
+                annovar_freebayes = expand('resultados/annovar/freebayes/{S}/{S}.hg38_multianno.vcf', S=SAMPLE),
+                annovar_strelka = expand('resultados/annovar/strelka/{P}/{P}.hg38_multianno.vcf', P=PATIENTS),
+
+# Análisis
+
+rule annovar_freebayes:
+    input:
+        vcf = "resultados/freebayes/{S}.vcf"
+    output:
+        directory("resultados/annovar/freebayes/{S}"),
+        "resultados/annovar/freebayes/{S}/{S}.hg38_multianno.vcf"
+    resources:
+        runtime=1440,
+        cpus_per_task=4,
+        mem_mb=8000,
+        account="othcx"
+    params:
+        annovar_dir = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/software/annovar",
+        humandb = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/software/annovar/humandb"
+    shell:
+        """
+        module load cesga/system perl/5.16.3
+        mkdir -p resultados/annovar/freebayes/{wildcards.S}
+        {params.annovar_dir}/table_annovar.pl {input.vcf} {params.humandb} \
+            -buildver hg38 \
+            -out resultados/annovar/freebayes/{wildcards.S}/{wildcards.S} \
+            -remove \
+            -protocol refGene,cosmic100 \
+            -operation g,f \
+            -nastring . \
+            -vcfinput
+        module unload cesga/system perl/5.16.3
+        """
+
+rule annovar_strelka:
+    input:
+        vcf = "resultados/strelka/{P}/variants/{P}.merged.vcf.gz"
+    output:
+        directory("resultados/annovar/strelka/{P}"),
+        "resultados/annovar/strelka/{P}/{P}.hg38_multianno.vcf"
+    resources:
+        runtime=1440,
+        cpus_per_task=4,
+        mem_mb=8000,
+        account="othcx"
+    params:
+        annovar_dir = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/software/annovar",
+        humandb = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/software/annovar/humandb"
+    shell:
+        """
+        module load cesga/system perl/5.16.3
+        module load cesga/2020 bcftools/1.19
+
+        mkdir -p resultados/annovar/strelka/{wildcards.P}
+
+        # Paso 1: Añadir campo GT al header y a cada línea
+        bcftools view {input.vcf} | \
+        awk 'BEGIN {{OFS="\\t"}} \
+            /^#/ {{ \
+                if ($0 ~ /^##FORMAT=<ID=GT/) {{ next }}  # Eliminar GT existente (si lo hay)
+                print; \
+                if ($0 ~ /^#CHROM/) {{ print "##FORMAT=<ID=GT,Number=1,Type=String,Description=\\"Genotype\\">" }} \
+            }} \
+            !/^#/ {{ \
+                $9 = "GT:" $9; \
+                $10 = "0/0:" $10; \
+                $11 = "0/1:" $11; \
+                print \
+            }}' > resultados/annovar/strelka/{wildcards.P}/{wildcards.P}_withGT.vcf
+
+        # Paso 2: Anotar con ANNOVAR
+        {params.annovar_dir}/table_annovar.pl \
+            resultados/annovar/strelka/{wildcards.P}/{wildcards.P}_withGT.vcf \
+            {params.humandb} \
+            -buildver hg38 \
+            -out resultados/annovar/strelka/{wildcards.P}/{wildcards.P} \
+            -remove \
+            -protocol refGene,cosmic100 \
+            -operation g,f \
+            -nastring . \
+            -vcfinput
+
+        module unload cesga/system perl/5.16.3
+        module unload cesga/2020 bcftools/1.19
+        """

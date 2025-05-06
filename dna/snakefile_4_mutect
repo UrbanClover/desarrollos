@@ -1,0 +1,166 @@
+# Snakefile para WES
+
+import sys
+sys.path.append('ngs')
+import sample_ids
+SAMPLE = sample_ids.get_sample_ids('data')
+print("Muestras detectadas: ", SAMPLE)
+
+# Modificar la sección de muestras
+PATIENTS = list(set([s.rsplit('_', 1)[0] for s in SAMPLE]))
+print("Pacientes detectados: ", PATIENTS)
+
+# Referencia
+
+REF_GENOME = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/ref/wes_ref/GRCh38.p14.genome.fa"
+GNOMAD = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/af-only-gnomad.hg38.vcf.gz"
+GNOMAD_INDEX = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/af-only-gnomad.hg38.vcf.gz.tbi"
+PON = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/1000g_pon.hg38.vcf.gz"
+PON_INDEX = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/1000g_pon.hg38.vcf.gz.tbi"
+COMMON_VARIANTS = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/small_exac_common_3.hg38.vcf.gz"
+COMMON_VARIANTS_INDEX = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/small_exac_common_3.hg38.vcf.gz.tbi"
+
+# Rules
+
+localrules:  all
+
+rule all:
+        input:
+                contamination_table = expand('resultados/mutect2/{P}/contamination.table', P=PATIENTS),
+                mutect2_raw = expand('resultados/mutect2/{P}/{P}.mutect2.vcf.gz', P=PATIENTS),
+                mutect2_vcf = expand('resultados/mutect2/{P}/{P}.mutect2.filtered.vcf.gz', P=PATIENTS),
+                annovar_mutect2 = expand('resultados/annovar/mutect2/{P}/{P}.hg38_multianno.vcf', P=PATIENTS)
+
+# ======== Reglas para Mutect2 ========
+rule mutect2:
+    input:
+        mut = 'resultados/aligned/{P}_Cancer.sorted.bam',
+        wt = 'resultados/aligned/{P}_Normal.sorted.bam',
+        ref_fa = REF_GENOME,
+        gnomad = GNOMAD,
+        gnomad_index = GNOMAD_INDEX
+    output:
+        vcf = 'resultados/mutect2/{P}/{P}.mutect2.vcf.gz'
+    params:
+        normal_sample = lambda wildcards: wildcards.P + "_Normal"
+    resources:
+        runtime=1440,
+        cpus_per_task=8,
+        mem_mb=36000,
+        account="othcx"
+    shell:
+        """
+        mkdir -p resultados/mutect2/{wildcards.P}
+        module load gatk
+        gatk Mutect2 -R {input.ref_fa} \
+            -I {input.mut} \
+            -I {input.wt} \
+            -normal {params.normal_sample} \
+            --germline-resource {input.gnomad} \
+            -O {output.vcf} \
+            --dont-use-soft-clipped-bases true \
+            --min-base-quality-score 20 \
+            --max-reads-per-alignment-start 100 \
+            --max-population-af 0.001 \
+            --tumor-lod-to-emit 2.0 \
+            --normal-lod 3.0 \
+            -A "StrandBiasBySample" \
+            --annotation-group "StandardAnnotation" \
+            --disable-adaptive-pruning false
+        module unload gatk
+        """
+
+
+rule CreateContaminationTable:
+    input:
+        tumor = 'resultados/aligned/{P}_Cancer.sorted.bam',
+        normal = 'resultados/aligned/{P}_Normal.sorted.bam',
+        gnomad = GNOMAD,
+        common = COMMON_VARIANTS,
+        gnomad_index = GNOMAD_INDEX
+    output:
+        tumor_table = 'resultados/mutect2/{P}/tumor.table',
+        normal_table = 'resultados/mutect2/{P}/normal.table',
+        contamination = 'resultados/mutect2/{P}/contamination.table'
+    resources:
+        runtime=1440,
+        cpus_per_task=8,
+        mem_mb=36000,
+        account="othcx"
+    shell:
+        """
+        module load gatk
+        gatk GetPileupSummaries -I {input.tumor} -V {input.gnomad} -L {input.common} --interval-merging-rule OVERLAPPING_ONLY -O {output.tumor_table}
+        gatk GetPileupSummaries -I {input.normal} -V {input.gnomad} -L {input.common} --interval-merging-rule OVERLAPPING_ONLY -O {output.normal_table}
+        gatk CalculateContamination -I {output.tumor_table} -matched {output.normal_table} -O {output.contamination}
+        module unload gatk
+        """
+
+rule FilterMutectCalls:
+    input:
+        mutect2_vcf = 'resultados/mutect2/{P}/{P}.mutect2.vcf.gz',
+        ref = REF_GENOME,
+        contamination = 'resultados/mutect2/{P}/contamination.table'
+    output:
+        filtered_vcf = 'resultados/mutect2/{P}/{P}.mutect2.filtered.vcf.gz'
+    resources:
+        runtime=1440,
+        cpus_per_task=8,
+        mem_mb=24000,
+        account="othcx"
+    shell:
+        """
+        module load gatk
+        gatk FilterMutectCalls \
+            -V {input.mutect2_vcf} \
+            -R {input.ref} \
+            --contamination-table {input.contamination} \
+            --min-median-mapping-quality 20 \
+            --min-reads-per-strand 1 \
+            --unique-alt-read-count 2 \
+            --max-n-ratio 0.1 \
+            --max-events-in-region 3 \
+            -O {output.filtered_vcf}
+        module unload gatk
+        
+        module load cesga/2020 bcftools/1.19
+        bcftools view -f 'PASS' {output.filtered_vcf} -O z -o {output.filtered_vcf}.tmp
+        mv {output.filtered_vcf}.tmp {output.filtered_vcf}
+        tabix -p vcf {output.filtered_vcf}
+        module unload cesga/2020 bcftools/1.19
+        """
+
+rule annovar_mutect2:
+    input:
+        vcf = "resultados/mutect2/{P}/{P}.mutect2.filtered.vcf.gz"
+    output:
+        directory("resultados/annovar/mutect2/{P}"),
+        "resultados/annovar/mutect2/{P}/{P}.hg38_multianno.vcf"
+    resources:
+        runtime=1440,
+        cpus_per_task=8,
+        mem_mb=8000,
+        account="othcx"
+    params:
+        annovar_dir = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/software/annovar",
+        humandb = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/software/annovar/humandb"
+    shell:
+        """
+        module load cesga/system perl/5.16.3
+        module load cesga/2020 bcftools/1.19
+        mkdir -p resultados/annovar/mutect2/{wildcards.P}
+        zcat {input.vcf} > resultados/annovar/mutect2/{wildcards.P}/{wildcards.P}.temp.vcf
+        {params.annovar_dir}/table_annovar.pl \
+            resultados/annovar/mutect2/{wildcards.P}/{wildcards.P}.temp.vcf \
+            {params.humandb} \
+            -buildver hg38 \
+            -out resultados/annovar/mutect2/{wildcards.P}/{wildcards.P} \
+            -remove \
+            -protocol refGene \
+            -operation g \
+            -nastring . \
+            -vcfinput
+        rm resultados/annovar/mutect2/{wildcards.P}/{wildcards.P}.temp.vcf
+        module unload cesga/system perl/5.16.3
+        module unload cesga/2020 bcftools/1.19
+        """

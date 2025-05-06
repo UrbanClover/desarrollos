@@ -1,0 +1,145 @@
+# Snakefile_cancer.smk - Procesamiento de muestras Cancerosas + Mutect2
+import sys
+sys.path.append('ngs')
+import sample_ids
+
+# Muestras Cancerosas (ej: LC_1_Cancer, LC_2_Cancer...)
+CANCER_SAMPLES = [s for s in sample_ids.get_sample_ids('data') if s.endswith('_Cancer')]
+PATIENTS_CANCER = list(set([s.rsplit('_', 1)[0] for s in CANCER_SAMPLES]))
+
+# Referencia y recursos (ajusta las rutas)
+REF_GENOME = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/ref/wes_ref/GRCh38.p14.genome.fa"
+GNOMAD = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/af-only-gnomad.hg38.vcf.gz"
+GNOMAD_INDEX = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/af-only-gnomad.hg38.vcf.gz.tbi"
+PON = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/1000g_pon.hg38.vcf.gz"
+PON_INDEX = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/1000g_pon.hg38.vcf.gz.tbi"
+COMMON_VARIANTS = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/small_exac_common_3.hg38.vcf.gz"
+COMMON_VARIANTS_INDEX = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/small_exac_common_3.hg38.vcf.gz.tbi"
+
+# === Reglas para Cancer ===
+rule all:
+    input:
+        expand('resultados/cancer/{sample}.sorted.bam', sample=CANCER_SAMPLES),
+        contamination_table = expand('resultados/mutect2/{P}/contamination.table', P=PATIENTS_CANCER),
+        mutect2_raw = expand('resultados/mutect2/{P}/{P}.mutect2.vcf.gz', P=PATIENTS_CANCER),
+        mutect2_filtered = expand('resultados/mutect2/{P}/{P}.mutect2.filtered.vcf.gz', P=PATIENTS_CANCER),
+        annovar_results = expand('resultados/annovar/mutect2/{P}/{P}.hg38_multianno.vcf', P=PATIENTS_CANCER)
+
+# Alineamiento de Cancer (similar a Normales pero en directorio separado)
+rule align_cancer:
+    input:
+        r1 = "data/{sample}_R1.fastq.gz",
+        r2 = "data/{sample}_R2.fastq.gz",
+        ref = REF_GENOME
+    output:
+        bam = "resultados/cancer/{sample}.sorted.bam"
+    params:
+        sample_name = lambda wildcards: wildcards.sample.replace("_Cancer", "")
+    resources:
+        runtime=600,
+        cpus_per_task=4,
+        mem_mb=16000
+    shell:
+        """
+        module load bwa samtools
+        mkdir -p resultados/cancer
+        bwa mem -t {resources.cpus_per_task} \
+        -R "@RG\\tID:{params.sample_name}\\tSM:{params.sample_name}\\tLB:WES\\tPL:ILLUMINA" \
+        {input.ref} {input.r1} {input.r2} | \
+        samtools sort -@ {resources.cpus_per_task} -o {output.bam} -
+        samtools index {output.bam}
+        """
+
+# === Reglas de Mutect2 (adaptadas al contexto de Cancer) ===
+rule mutect2:
+    input:
+        tumor = "resultados/cancer/{P}_Cancer.sorted.bam",
+        normal = "resultados/normal/{P}_Normal.sorted.bam",  # ¡Depende de Snakefile_normal!
+        ref_fa = REF_GENOME,
+        gnomad = GNOMAD,
+        gnomad_index = GNOMAD_INDEX
+    output:
+        vcf = "resultados/mutect2/{P}/{P}.mutect2.vcf.gz"
+    params:
+        normal_sample = "{P}"
+    resources:
+        runtime = 1440,      # 24 horas
+        cpus_per_task = 8,   # 8 CPUs
+        mem_mb = 36000       # 36 GB de RAM
+    shell:
+        """
+        mkdir -p resultados/mutect2/{wildcards.P}
+        module load gatk
+        gatk Mutect2 -R {input.ref_fa} \
+            -I {input.tumor} \
+            -I {input.normal} \
+            -normal {params.normal_sample} \
+            --germline-resource {input.gnomad} \
+            -O {output.vcf} \
+            --dont-use-soft-clipped-bases true \
+            --min-base-quality-score 20 \
+            --max-reads-per-alignment-start 100 \
+            --max-population-af 0.001 \
+            --tumor-lod-to-emit 2.0 \
+            --normal-lod 3.0 \
+            -A "StrandBiasBySample" \
+            --annotation-group "StandardAnnotation" \
+            --disable-adaptive-pruning false
+        module unload gatk
+        """
+
+rule CreateContaminationTable:
+    input:
+        tumor = "resultados/cancer/{P}_Cancer.sorted.bam",
+        normal = "resultados/normal/{P}_Normal.sorted.bam",
+        gnomad = GNOMAD,
+        common = COMMON_VARIANTS,
+        gnomad_index = GNOMAD_INDEX 
+    output:
+        contamination = "resultados/mutect2/{P}/contamination.table"
+    resources:
+        runtime = 720,       # 12 horas
+        cpus_per_task = 8,   # 8 CPUs
+        mem_mb = 16000       # 16 GB de RAM
+    shell:
+        """
+        module load gatk
+        gatk GetPileupSummaries -I {input.tumor} -V {input.gnomad} -L {input.common} --interval-merging-rule OVERLAPPING_ONLY -O resultados/mutect2/{wildcards.P}/tumor.table
+        gatk GetPileupSummaries -I {input.normal} -V {input.gnomad} -L {input.common} --interval-merging-rule OVERLAPPING_ONLY -O resultados/mutect2/{wildcards.P}/normal.table
+        gatk CalculateContamination -I resultados/mutect2/{wildcards.P}/tumor.table -matched resultados/mutect2/{wildcards.P}/normal.table -O {output.contamination}
+        """
+
+rule FilterMutectCalls:
+    input:
+        vcf = "resultados/mutect2/{P}/{P}.mutect2.vcf.gz",
+        contamination = "resultados/mutect2/{P}/contamination.table",
+        ref = REF_GENOME
+    output:
+        filtered_vcf = "resultados/mutect2/{P}/{P}.mutect2.filtered.vcf.gz"
+    resources:
+        runtime = 480,        # 8 horas
+        cpus_per_task = 4,   # 4 CPUs
+        mem_mb = 24000       # 24 GB de RAM
+    shell:
+        """
+        module load gatk
+        gatk FilterMutectCalls -V {input.vcf} -R {input.ref} --contamination-table {input.contamination} -O {output.filtered_vcf}
+        """
+
+rule annovar_mutect2:
+    input:
+        vcf = "resultados/mutect2/{P}/{P}.mutect2.filtered.vcf.gz"
+    output:
+        "resultados/annovar/mutect2/{P}/{P}.hg38_multianno.vcf"
+    params:
+        annovar_dir = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/software/annovar",
+        humandb = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/software/annovar/humandb"
+    resources:
+        runtime = 360,        # 6 horas
+        cpus_per_task = 2,   # 2 CPUs
+        mem_mb = 8000        # 8 GB de RAM
+    shell:
+        """
+        mkdir -p resultados/annovar/mutect2/{wildcards.P}
+        {params.annovar_dir}/table_annovar.pl {input.vcf} {params.humandb} -buildver hg38 -out resultados/annovar/mutect2/{wildcards.P}/{wildcards.P} -protocol refGene -operation g -nastring . -vcfinput
+        """

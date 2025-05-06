@@ -1,0 +1,120 @@
+import sys
+sys.path.append('ngs')
+import sample_ids
+
+# Muestras a procesar
+SAMPLE = [
+    "LC_1_Cancer", "LC_1_Normal",
+    "LC_2_Cancer", "LC_2_Normal",
+    "LC_3_Cancer", "LC_3_Normal",
+    "LC_4_Cancer", "LC_4_Normal",
+    "LC_5_Cancer", "LC_5_Normal"
+]
+
+PLINK_OUTDIR = "resultados/plink_final"
+REF_GENOME = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/ref/wes_ref/GRCh38.p14.genome.fa"
+
+localrules: all
+
+rule all:
+    input:
+        expand(PLINK_OUTDIR + "/merged_dataset_qc.{ext}", ext=["bed", "bim", "fam"])
+
+rule compress_vcf:
+    input:
+        "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/resultados/freebayes/{sample}.vcf"
+    output:
+        "resultados/freebayes/{sample}.vcf.gz"
+    shell:
+        """
+        bgzip -c {input} > {output} 
+        tabix -p vcf {output}
+        """
+
+rule vcf_to_plink:
+    input:
+        vcf = "resultados/freebayes/{sample}.vcf.gz"
+    output:
+        bed = temp(PLINK_OUTDIR + "/{sample}/{sample}.bed"),
+        bim = temp(PLINK_OUTDIR + "/{sample}/{sample}.bim"),
+        fam = temp(PLINK_OUTDIR + "/{sample}/{sample}.fam")
+    log:
+        PLINK_OUTDIR + "/logs/{sample}_plink.log"
+    shell:
+        """
+        mkdir -p {PLINK_OUTDIR}/{wildcards.sample}
+        
+        # Paso 1: Normalizar y guardar en archivo temporal
+        bcftools norm {input.vcf} \
+            --fasta-ref {REF_GENOME} \
+            --multiallelics -any \
+            -Ou | \
+        bcftools view -O z -o {PLINK_OUTDIR}/{wildcards.sample}/temp_normalized.vcf.gz
+
+        # Paso 2: Convertir a PLINK desde el archivo temporal
+        plink2 --vcf {PLINK_OUTDIR}/{wildcards.sample}/temp_normalized.vcf.gz \
+            --make-bed \
+            --allow-extra-chr \
+            --set-missing-var-ids '@:#' \
+            --out {PLINK_OUTDIR}/{wildcards.sample}/{wildcards.sample}
+
+        # Limpiar archivo temporal
+        rm -f {PLINK_OUTDIR}/{wildcards.sample}/temp_normalized.vcf.gz
+        """
+
+
+rule merge_plink:
+    input:
+        vcfs = expand("resultados/freebayes/{sample}.vcf.gz", sample=SAMPLE)
+    output:
+        bed = PLINK_OUTDIR + "/merged_dataset.bed",
+        bim = PLINK_OUTDIR + "/merged_dataset.bim",
+        fam = PLINK_OUTDIR + "/merged_dataset.fam"
+    shell:
+        """
+        # Cargar módulos
+        module load cesga/2020 bcftools/1.19 gcc/system plink/2.00a2.3
+        
+        # Paso 1: Filtrar y normalizar cada VCF
+        for vcf in {input.vcfs}; do
+            NORM_VCF="${{vcf%.vcf.gz}}.norm.vcf.gz"
+            # Filtra SNPs bialélicos y divide multialélicos
+            bcftools view -m2 -M2 -v snps "$vcf" | 
+            bcftools norm --fasta-ref {REF_GENOME} -m- | 
+            bcftools view -Oz -o "$NORM_VCF"
+            tabix -p vcf "$NORM_VCF"
+        done
+
+        # Paso 2: Merge y conversión a PLINK
+        bcftools merge resultados/freebayes/*.norm.vcf.gz -Oz -o merged.vcf.gz
+        plink2 --vcf merged.vcf.gz \
+            --make-bed \
+            --allow-extra-chr \
+            --max-alleles 2 \
+            --out {PLINK_OUTDIR}/merged_dataset
+
+        # Limpieza
+        rm -f merged.vcf.gz* resultados/freebayes/*.norm.vcf.gz*
+        """
+
+rule qc_post_merge:
+    input:
+        bed = PLINK_OUTDIR + "/merged_dataset.bed",
+        bim = PLINK_OUTDIR + "/merged_dataset.bim",
+        fam = PLINK_OUTDIR + "/merged_dataset.fam"
+    output:
+        bed = PLINK_OUTDIR + "/merged_dataset_qc.bed",
+        bim = PLINK_OUTDIR + "/merged_dataset_qc.bim",
+        fam = PLINK_OUTDIR + "/merged_dataset_qc.fam"
+    shell:
+        """
+        # Obtener el nombre base sin extensión
+        INPUT_BASE=$(basename {input.bed} .bed)
+        OUTPUT_BASE=$(basename {output.bed} .bed)
+
+        plink2 --bfile {PLINK_OUTDIR}/$INPUT_BASE \
+            --make-bed \
+            --allow-extra-chr \
+            --out {PLINK_OUTDIR}/$OUTPUT_BASE
+        """
+

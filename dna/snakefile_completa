@@ -1,0 +1,403 @@
+# Snakefile para WES
+
+import sys
+sys.path.append('ngs')
+import sample_ids
+SAMPLE = sample_ids.get_sample_ids('data')
+print("Muestras detectadas: ", SAMPLE)
+
+# Modificar la sección de muestras
+PATIENTS = list(set([s.rsplit('_', 1)[0] for s in SAMPLE]))
+print("Pacientes detectados: ", PATIENTS)
+
+# Referencia
+
+REF_GENOME = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/ref/wes_ref/GRCh38.p14.genome.fa"
+GNOMAD = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/af-only-gnomad.hg38.vcf.gz"
+GNOMAD_INDEX = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/af-only-gnomad.hg38.vcf.gz.tbi"
+PON = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/1000g_pon.hg38.vcf.gz"
+PON_INDEX = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/1000g_pon.hg38.vcf.gz.tbi"
+COMMON_VARIANTS = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/small_exac_common_3.hg38.vcf.gz"
+COMMON_VARIANTS_INDEX = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/recursos/small_exac_common_3.hg38.vcf.gz.tbi"
+
+# Rules
+
+localrules:  all
+
+rule all:
+        input:
+                trim = expand('resultados/trimmed/{S}_trimmed_{N}.fastq.gz', S=SAMPLE, N=['1', '2']),
+                bam = expand('resultados/aligned/{S}.sorted.bam', S=SAMPLE),
+                vcf = expand('resultados/freebayes/{S}.vcf', S=SAMPLE),
+                strelka_vcf = expand('resultados/strelka/{P}/variants/{P}.merged.vcf.gz', P=PATIENTS),
+                annovar_freebayes = expand('resultados/annovar/freebayes/{S}/{S}.hg38_multianno.vcf', S=SAMPLE),
+                annovar_strelka = expand('resultados/annovar/strelka/{P}/{P}.hg38_multianno.vcf', P=PATIENTS),
+                # Nuevos objetivos para Mutect2
+                contamination_table = expand('resultados/mutect2/{P}/contamination.table', P=PATIENTS),
+                mutect2_raw = expand('resultados/mutect2/{P}/{P}.mutect2.vcf.gz', P=PATIENTS),
+                mutect2_vcf = expand('resultados/mutect2/{P}/{P}.mutect2.filtered.vcf.gz', P=PATIENTS)
+                #annovar_mutect2 = expand('resultados/annovar/mutect2/{P}/{P}.hg38_multianno.vcf', P=PATIENTS)
+# Análisis
+
+rule trim:
+        input:
+                r1="data/{S}_R1.fastq.gz",
+                r2="data/{S}_R2.fastq.gz"
+        output:
+                r1='resultados/trimmed/{S}_trimmed_1.fastq.gz',
+                r2='resultados/trimmed/{S}_trimmed_2.fastq.gz',
+                html='resultados/trimmed/{S}_fastp.html'
+        resources:
+                runtime=90,
+                cpus_per_task=4,
+                mem_mb=4000,
+                account="othcx"
+                
+        shell:
+                """
+                module load cesga/2020 gcccore/system fastp/0.22.0 
+                fastp -i {input.r1} -I {input.r2} \
+                -o {output.r1} -O {output.r2} \
+                --detect_adapter_for_pe \
+                --trim_poly_g --poly_g_min_len=10 \
+                --low_complexity_filter \
+                --overrepresentation_analysis \
+                --correction \
+                --html={output.html} \
+                module unload cesga/2020 gcccore/system fastp/0.22.0
+                """
+rule bwa_mem:
+        input: 
+                r1='resultados/trimmed/{S}_trimmed_1.fastq.gz',
+                r2='resultados/trimmed/{S}_trimmed_2.fastq.gz'
+        output:
+                'resultados/aligned/{S}.unsorted.bam'
+        resources:
+                runtime=2880,
+                cpus_per_task=8,
+                mem_mb=64000,
+                account="othcx"
+        params:
+                ref=REF_GENOME,
+                rg="@RG\\tID:{S}\\tSM:{S}\\tPL:ILLUMINA" 
+        shell:
+                """
+                module load cesga/2020 gcccore/system bwa/0.7.17 samtools/1.19
+                mkdir -p resultados/aligned 
+                bwa mem  -R '{params.rg}' {params.ref} {input.r1} {input.r2} | \
+                samtools view -Sb - > {output} 
+                module unload cesga/2020 gcccore/system bwa/0.7.17 samtools/1.19
+                """
+
+rule samtools_sort:
+        input:
+                'resultados/aligned/{S}.unsorted.bam'
+        output:
+                bam='resultados/aligned/{S}.sorted.bam',
+                bai='resultados/aligned/{S}.sorted.bam.bai'
+        resources:
+                runtime=900,
+                cpus_per_task=4,
+                mem_mb=64000,
+                account="othcx"
+        shell:
+                """
+                module load cesga/2020 gcccore/system samtools/1.19
+                samtools sort -o {output.bam} {input}
+                samtools index {output.bam}
+                module unload cesga/2020 gcccore/system samtools/1.19
+                """
+
+
+rule freebayes:
+        input:
+                bam='resultados/aligned/{S}.sorted.bam'
+        output:
+                vcf='resultados/freebayes/{S}.vcf'
+        resources:
+                runtime=2880,
+                cpus_per_task=8,
+                mem_mb=12000,
+                account='othcx'
+        params:
+                ref=REF_GENOME
+        shell:
+                """
+                module load cesga/2020 gcc/system openmpi/4.0.5_ft3 freebayes/1.3.7 
+                mkdir -p resultados/freebayes 
+                freebayes -f {params.ref} --min-alternate-count 10 --min-base-quality 20 {input.bam} > {output.vcf} 
+                module unload cesga/2020 gcc/system openmpi/4.0.5_ft3 freebayes/1.3.7 
+                """
+
+rule strelka_somatic:
+    input:
+        mut = 'resultados/aligned/{P}_Cancer.sorted.bam',
+        wt = 'resultados/aligned/{P}_Normal.sorted.bam',
+        ref = REF_GENOME,
+        regions = "recursos/GRCh38_main_chromosomes.bed.gz"
+    output:
+        vcf = 'resultados/strelka/{P}/variants/{P}.merged.vcf.gz'
+    resources:
+        runtime=900,
+        cpus_per_task=8,
+        mem_mb=2000,
+        account="othcx"
+    shell:
+        """
+        module load cesga/2020 gcccore/system python/2.7.18
+
+        mkdir -p resultados/strelka/{wildcards.P}/variants/
+
+        software/strelka/strelka-2.9.10.centos6_x86_64/bin/configureStrelkaSomaticWorkflow.py \
+            --normalBam {input.wt} \
+            --tumorBam {input.mut} \
+            --referenceFasta {input.ref} \
+            --exome \
+            --callRegions {input.regions} \
+            --runDir resultados/strelka/{wildcards.P}/strelka/
+        
+        resultados/strelka/{wildcards.P}/strelka/runWorkflow.py -m local -j {resources.cpus_per_task}
+
+        module unload cesga/2020 gcccore/system python/2.7.18
+
+        module load cesga/2020 bcftools/1.19
+
+        bcftools view -f PASS \
+           resultados/strelka/{wildcards.P}/strelka/results/variants/somatic.snvs.vcf.gz \
+           -O z \
+           -o resultados/strelka/{wildcards.P}/variants/{wildcards.P}.snvs.vcf.gz
+        tabix -p vcf resultados/strelka/{wildcards.P}/variants/{wildcards.P}.snvs.vcf.gz
+
+        bcftools view -f PASS \
+            resultados/strelka/{wildcards.P}/strelka/results/variants/somatic.indels.vcf.gz \
+            -O z \
+            -o resultados/strelka/{wildcards.P}/variants/{wildcards.P}.indels.vcf.gz
+        tabix -p vcf resultados/strelka/{wildcards.P}/variants/{wildcards.P}.indels.vcf.gz
+
+        bcftools concat -a \
+            resultados/strelka/{wildcards.P}/variants/{wildcards.P}.snvs.vcf.gz \
+            resultados/strelka/{wildcards.P}/variants/{wildcards.P}.indels.vcf.gz \
+            -O z \
+            -o {output.vcf}
+        tabix -p vcf {output.vcf}
+
+        module unload cesga/2020 bcftools/1.19
+        """
+
+
+rule annovar_freebayes:
+    input:
+        vcf = "resultados/freebayes/{S}.vcf"
+    output:
+        directory("resultados/annovar/freebayes/{S}"),
+        "resultados/annovar/freebayes/{S}/{S}.hg38_multianno.vcf"
+    resources:
+        runtime=1440,
+        cpus_per_task=4,
+        mem_mb=8000,
+        account="othcx"
+    params:
+        annovar_dir = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/software/annovar",
+        humandb = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/software/annovar/humandb"
+    shell:
+        """
+        module load cesga/system perl/5.16.3
+        mkdir -p resultados/annovar/freebayes/{wildcards.S}
+        {params.annovar_dir}/table_annovar.pl {input.vcf} {params.humandb} \
+            -buildver hg38 \
+            -out resultados/annovar/freebayes/{wildcards.S}/{wildcards.S} \
+            -remove \
+            -protocol refGene,cosmic100 \
+            -operation g,f \
+            -nastring . \
+            -vcfinput
+        module unload cesga/system perl/5.16.3
+        """
+
+rule annovar_strelka:
+    input:
+        vcf = "resultados/strelka/{P}/variants/{P}.merged.vcf.gz"
+    output:
+        directory("resultados/annovar/strelka/{P}"),
+        "resultados/annovar/strelka/{P}/{P}.hg38_multianno.vcf"
+    resources:
+        runtime=1440,
+        cpus_per_task=4,
+        mem_mb=8000,
+        account="othcx"
+    params:
+        annovar_dir = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/software/annovar",
+        humandb = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/software/annovar/humandb"
+    shell:
+        """
+        module load cesga/system perl/5.16.3
+        module load cesga/2020 bcftools/1.19
+
+        mkdir -p resultados/annovar/strelka/{wildcards.P}
+
+        # Paso 1: Añadir campo GT al header y a cada línea
+        bcftools view {input.vcf} | \
+        awk 'BEGIN {{OFS="\\t"}} \
+            /^#/ {{ \
+                if ($0 ~ /^##FORMAT=<ID=GT/) {{ next }}  # Eliminar GT existente (si lo hay)
+                print; \
+                if ($0 ~ /^#CHROM/) {{ print "##FORMAT=<ID=GT,Number=1,Type=String,Description=\\"Genotype\\">" }} \
+            }} \
+            !/^#/ {{ \
+                $9 = "GT:" $9; \
+                $10 = "0/0:" $10; \
+                $11 = "0/1:" $11; \
+                print \
+            }}' > resultados/annovar/strelka/{wildcards.P}/{wildcards.P}_withGT.vcf
+
+        # Paso 2: Anotar con ANNOVAR
+        {params.annovar_dir}/table_annovar.pl \
+            resultados/annovar/strelka/{wildcards.P}/{wildcards.P}_withGT.vcf \
+            {params.humandb} \
+            -buildver hg38 \
+            -out resultados/annovar/strelka/{wildcards.P}/{wildcards.P} \
+            -remove \
+            -protocol refGene,cosmic100 \
+            -operation g,f \
+            -nastring . \
+            -vcfinput
+
+        module unload cesga/system perl/5.16.3
+        module unload cesga/2020 bcftools/1.19
+        """
+
+
+
+# ======== Nuevas reglas para Mutect2 ========
+rule mutect2:
+    input:
+        mut = 'resultados/aligned/{P}_Cancer.sorted.bam',
+        wt = 'resultados/aligned/{P}_Normal.sorted.bam',
+        ref_fa = REF_GENOME,
+        gnomad = GNOMAD,
+        gnomad_index = GNOMAD_INDEX
+    output:
+        vcf = 'resultados/mutect2/{P}/{P}.mutect2.vcf.gz'
+    params:
+        normal_sample = lambda wildcards: wildcards.P + "_Normal"
+    resources:
+        runtime=240,
+        cpus_per_task=4,
+        mem_mb=36000,
+        account="othcx"
+    shell:
+        """
+        mkdir -p resultados/mutect2/{wildcards.P}
+        module load gatk
+        gatk Mutect2 -R {input.ref_fa} \
+            -I {input.mut} \
+            -I {input.wt} \
+            -normal {params.normal_sample} \
+            --germline-resource {input.gnomad} \
+            -O {output.vcf} \
+            --dont-use-soft-clipped-bases true \
+            --min-base-quality-score 20 \
+            --max-reads-per-alignment-start 100 \
+            --max-population-af 0.001 \
+            --tumor-lod-to-emit 2.0 \
+            --normal-lod 3.0 \
+            -A "StrandBiasBySample" \
+            --annotation-group "StandardAnnotation" \
+            --disable-adaptive-pruning false
+        module unload gatk
+        """
+
+
+rule CreateContaminationTable:
+    input:
+        tumor = 'resultados/aligned/{P}_Cancer.sorted.bam',
+        normal = 'resultados/aligned/{P}_Normal.sorted.bam',
+        gnomad = GNOMAD,
+        common = COMMON_VARIANTS,
+        gnomad_index = GNOMAD_INDEX
+    output:
+        tumor_table = 'resultados/mutect2/{P}/tumor.table',
+        normal_table = 'resultados/mutect2/{P}/normal.table',
+        contamination = 'resultados/mutect2/{P}/contamination.table'
+    resources:
+        runtime=360,
+        cpus_per_task=4,
+        mem_mb=36000,
+        account="othcx"
+    shell:
+        """
+        module load gatk
+        gatk GetPileupSummaries -I {input.tumor} -V {input.gnomad} -L {input.common} --interval-merging-rule OVERLAPPING_ONLY -O {output.tumor_table}
+        gatk GetPileupSummaries -I {input.normal} -V {input.gnomad} -L {input.common} --interval-merging-rule OVERLAPPING_ONLY -O {output.normal_table}
+        gatk CalculateContamination -I {output.tumor_table} -matched {output.normal_table} -O {output.contamination}
+        module unload gatk
+        """
+
+rule FilterMutectCalls:
+    input:
+        mutect2_vcf = 'resultados/mutect2/{P}/{P}.mutect2.vcf.gz',
+        ref = REF_GENOME,
+        contamination = 'resultados/mutect2/{P}/contamination.table'
+    output:
+        filtered_vcf = 'resultados/mutect2/{P}/{P}.mutect2.filtered.vcf.gz'
+    resources:
+        runtime=240,
+        cpus_per_task=4,
+        mem_mb=24000,
+        account="othcx"
+    shell:
+        """
+        module load gatk
+        gatk FilterMutectCalls \
+            -V {input.mutect2_vcf} \
+            -R {input.ref} \
+            --contamination-table {input.contamination} \
+            --min-median-mapping-quality 20 \
+            --min-reads-per-strand 1 \
+            --unique-alt-read-count 2 \
+            --max-n-ratio 0.1 \
+            --max-events-in-region 3 \
+            -O {output.filtered_vcf}
+        module unload gatk
+        
+        module load cesga/2020 bcftools/1.19
+        bcftools view -f 'PASS' {output.filtered_vcf} -O z -o {output.filtered_vcf}.tmp
+        mv {output.filtered_vcf}.tmp {output.filtered_vcf}
+        tabix -p vcf {output.filtered_vcf}
+        module unload cesga/2020 bcftools/1.19
+        """
+
+rule annovar_mutect2:
+    input:
+        vcf = "resultados/mutect2/{P}/{P}.mutect2.filtered.vcf.gz"
+    output:
+        directory("resultados/annovar/mutect2/{P}"),
+        "resultados/annovar/mutect2/{P}/{P}.hg38_multianno.vcf"
+    resources:
+        runtime=1440,
+        cpus_per_task=4,
+        mem_mb=8000,
+        account="othcx"
+    params:
+        annovar_dir = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/software/annovar",
+        humandb = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/wes/software/annovar/humandb"
+    shell:
+        """
+        module load cesga/system perl/5.16.3
+        module load cesga/2020 bcftools/1.19
+        mkdir -p resultados/annovar/mutect2/{wildcards.P}
+        zcat {input.vcf} > resultados/annovar/mutect2/{wildcards.P}/{wildcards.P}.temp.vcf
+        {params.annovar_dir}/table_annovar.pl \
+            resultados/annovar/mutect2/{wildcards.P}/{wildcards.P}.temp.vcf \
+            {params.humandb} \
+            -buildver hg38 \
+            -out resultados/annovar/mutect2/{wildcards.P}/{wildcards.P} \
+            -remove \
+            -protocol refGene \
+            -operation g \
+            -nastring . \
+            -vcfinput
+        rm resultados/annovar/mutect2/{wildcards.P}/{wildcards.P}.temp.vcf
+        module unload cesga/system perl/5.16.3
+        module unload cesga/2020 bcftools/1.19
+        """

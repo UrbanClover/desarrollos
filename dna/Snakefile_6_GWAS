@@ -1,0 +1,135 @@
+import sys
+sys.path.append('ngs')
+import sample_ids
+
+# Configuración global
+SAMPLE = [
+    "LC_1_Cancer", "LC_1_Normal",
+    "LC_2_Cancer", "LC_2_Normal",
+    "LC_3_Cancer", "LC_3_Normal",
+    "LC_4_Cancer", "LC_4_Normal",
+    "LC_5_Cancer", "LC_5_Normal"
+]
+PLINK_OUTDIR = "resultados/plink_final"
+REF_GENOME = "/mnt/lustre/scratch/nlsas/home/otras/hcx/iba/ngs/ref/wes_ref/GRCh38.p14.genome.fa"
+GWAS_RESULTS_DIR = "resultados/gwas"
+QC_DIR = "resultados/qc"
+PHENO_FILE = "data/phenotypes.txt"
+PCA_COMPONENTS = 10  
+
+localrules: all
+
+rule all:
+    input:
+        # Resultados finales que queremos generar
+        expand(GWAS_RESULTS_DIR + "/gwas_results.PHENO.glm.logistic", allow_missing=True),
+        expand(QC_DIR + "/merged_dataset_qc_pca.eigenvec"),
+        expand(QC_DIR + "/merged_dataset_qc_filt.afreq"),
+        expand(QC_DIR + "/gwas_manhattan.png"),
+        expand(QC_DIR + "/gwas_qqplot.png")
+
+
+# --------------------------------------------------
+# Control de Calidad Adicional (Post-Merge)
+# --------------------------------------------------
+rule qc_advanced:
+    input:
+        bed = PLINK_OUTDIR + "/merged_dataset_qc.bed",
+        bim = PLINK_OUTDIR + "/merged_dataset_qc.bim",
+        fam = PLINK_OUTDIR + "/merged_dataset_qc.fam"
+    output:
+        bed = QC_DIR + "/merged_dataset_qc_filt.bed",
+        bim = QC_DIR + "/merged_dataset_qc_filt.bim",
+        fam = QC_DIR + "/merged_dataset_qc_filt.fam"
+    params:
+        maf = 0.01,
+        geno = 0.05,
+        hwe = 1e-6,
+        input_prefix = lambda wildcards, input: input.bed.replace('.bed', ''),  # Ej: resultados/plink_final/merged_dataset_qc
+        output_prefix = lambda wildcards, output: output.bed.replace('.bed', '')  # Ej: resultados/qc/merged_dataset_qc_filt
+    shell:
+        """
+        mkdir -p {QC_DIR}
+        plink2 --bfile {params.input_prefix} \
+            --maf {params.maf} \
+            --geno {params.geno} \
+            --hwe {params.hwe} \
+            --set-missing-var-ids @:# \
+            --make-bed \
+            --allow-extra-chr \
+            --out {params.output_prefix}
+        """
+
+# --------------------------------------------------
+# Calcular frecuencias alélicas (AF)
+# --------------------------------------------------
+rule allele_frequencies:
+    input:
+        bed = QC_DIR + "/merged_dataset_qc_filt.bed",
+        bim = QC_DIR + "/merged_dataset_qc_filt.bim",
+        fam = QC_DIR + "/merged_dataset_qc_filt.fam"
+    output:
+        freq_file = QC_DIR + "/merged_dataset_qc_filt.afreq"
+    params:
+        input_prefix = lambda wildcards, input: input.bed.replace('.bed', '')
+    shell:
+        """
+        plink2 --bfile {params.input_prefix} \
+            --freq \
+            --allow-extra-chr \
+            --out {params.input_prefix}
+        """
+
+# --------------------------------------------------
+# PCA
+# --------------------------------------------------
+rule pca_analysis:
+    input:
+        bed = QC_DIR + "/merged_dataset_qc_filt.bed",
+        bim = QC_DIR + "/merged_dataset_qc_filt.bim",
+        fam = QC_DIR + "/merged_dataset_qc_filt.fam",
+        freq = QC_DIR + "/merged_dataset_qc_filt.afreq"
+    output:
+        eigenvec = QC_DIR + "/merged_dataset_qc_pca.eigenvec",
+        eigenval = QC_DIR + "/merged_dataset_qc_pca.eigenval"
+    params:
+        input_prefix = lambda wildcards, input: input.bed.replace('.bed', ''),  
+        output_prefix = lambda wildcards, output: output.eigenvec.rsplit('.', 1)[0]  
+    shell:
+        """
+        plink2 --bfile {params.input_prefix} \
+            --read-freq {input.freq} \
+            --pca {PCA_COMPONENTS} \
+            --allow-extra-chr \
+            --out {params.output_prefix}
+        """
+
+# --------------------------------------------------
+# GWAS
+# --------------------------------------------------
+rule gwas_analysis:
+    input:
+        bed = QC_DIR + "/merged_dataset_qc_filt.bed",
+        bim = QC_DIR + "/merged_dataset_qc_filt.bim",
+        fam = QC_DIR + "/merged_dataset_qc_filt.fam",
+        pheno = PHENO_FILE,
+        eigenvec = QC_DIR + "/merged_dataset_qc_pca.eigenvec"  
+    output:
+        assoc = GWAS_RESULTS_DIR + "/gwas_results.PHENO.glm.logistic"
+    params:
+        covariates = "PC1,PC2,PC3",
+        input_prefix = lambda wildcards, input: input.bed.replace('.bed', ''),  
+        output_prefix = lambda wildcards, output: output.assoc.rsplit('.', 2)[0]  
+    shell:
+        """
+        mkdir -p {GWAS_RESULTS_DIR}
+        plink2 --bfile {params.input_prefix} \
+            --pheno {input.pheno} \
+            --pheno-name PHENO \
+            --covar {input.eigenvec} \
+            --covar-name {params.covariates} \
+            --glm \
+            --allow-extra-chr \
+            --out {params.output_prefix}
+        """
+
